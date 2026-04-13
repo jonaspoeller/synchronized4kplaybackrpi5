@@ -191,7 +191,7 @@ This reverts all system changes (config.txt, cmdline.txt, services, udev rules, 
 ```
 synchronized4kplaybackrpi5/
 ├── README.md                  # This file
-├── LICENSE                    # MIT License
+├── LICENSE                    # Proprietary license
 ├── setup_video_sync.sh        # One-click installer (contains Python scripts inline)
 ├── uninstall_video_sync.sh    # Uninstaller
 ├── video_sync_master.py       # Reference copy of master script
@@ -218,6 +218,6 @@ synchronized4kplaybackrpi5/
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+This software is proprietary. All rights reserved. See [LICENSE](LICENSE) for details.
 
-© 2025 Jonas Pöller
+© 2026 Licht-Konzept & Form Lichttechnische AG
