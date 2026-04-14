@@ -6,7 +6,7 @@ Flow: USB → SD → RAM → Synchronized Playback
   1. If USB present: copy video from USB to SD, then eject USB
   2. Copy video from SD to RAM (tmpfs)
   3. Broadcast sync commands to slaves
-  4. Play from RAM in a seamless loop (cvlc --input-repeat)
+  4. Play from RAM, re-sync all nodes at each loop boundary
   5. New USB inserted → udev restarts service → video updated
 """
 
@@ -22,6 +22,7 @@ import time
 import glob
 import hashlib
 import configparser
+import vlc
 
 # --- Configuration ---
 MOUNT_POINT = "/mnt/usb"
@@ -54,20 +55,33 @@ def detect_hdmi_port():
 
 HDMI_PORT = detect_hdmi_port()
 
-VLC_ARGS = [
-    "cvlc",
-    "--no-xlib",
-    "--quiet",
-    "--fullscreen",
-    "--no-video-title-show",
-    "--no-osd",
-    "--codec=drm_avcodec",
-    "--vout=drm_vout",
-    f"--drm-vout-display={HDMI_PORT}",
-    "--drm-vout-pool-dmabuf",
-    "--no-audio",
-    "--file-caching=2000",
-]
+
+def build_vlc_args_str():
+    """Build VLC argument string for vlc.Instance(), reading audio config."""
+    args = [
+        "--no-xlib",
+        "--quiet",
+        "--fullscreen",
+        "--no-video-title-show",
+        "--no-osd",
+        "--codec=drm_avcodec",
+        "--vout=drm_vout",
+        f"--drm-vout-display={HDMI_PORT}",
+        "--drm-vout-pool-dmabuf",
+        "--file-caching=2000",
+    ]
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE)
+    audio_enabled = config.get("audio", "enabled", fallback="no").strip().lower()
+    alsa_device = config.get("audio", "alsa_device", fallback="").strip()
+    if audio_enabled == "yes" and alsa_device:
+        args += ["--aout=alsa", f"--alsa-audio-device={alsa_device}"]
+    else:
+        args.append("--no-audio")
+    return ' '.join(args)
+
+
+VLC_ARGS_STR = build_vlc_args_str()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,21 +90,82 @@ logging.basicConfig(
 )
 log = logging.getLogger("video-sync-master")
 
-vlc_process = None
+vlc_instance = None
+vlc_player = None
+black_media = None
 sock = None
 running = True
+
+
+def set_framebuffer_black():
+    """Fill Linux framebuffer with black. Ensures monitor always sees black
+    (not 'no signal') when VLC's DRM plane is inactive."""
+    try:
+        with open("/dev/fb0", "wb") as fb:
+            chunk = b'\x00' * (1024 * 1024)  # 1MB of black
+            for _ in range(33):  # ~33MB covers 4K (3840x2160x4)
+                fb.write(chunk)
+        log.info("Framebuffer set to black")
+    except Exception as e:
+        log.warning(f"Could not set framebuffer black: {e}")
+
+
+def init_vlc():
+    """Initialize (or re-initialize) VLC instance and player."""
+    global vlc_instance, vlc_player, black_media
+    # Clean up old instance if re-initializing
+    if vlc_player:
+        try:
+            vlc_player.stop()
+        except Exception:
+            pass
+    vlc_instance = vlc.Instance(VLC_ARGS_STR)
+    vlc_player = vlc_instance.media_player_new()
+    if os.path.exists(BLACK_IMG):
+        black_media = vlc_instance.media_new(BLACK_IMG)
+    log.info("VLC instance initialized (python-vlc bindings)")
+
+
+def prepare_player(video_path):
+    """Prepare VLC: frame 1 paused. Exact Pi4 approach — no stop(), keeps DRM/HDMI alive.
+    Returns True on success.
+    """
+    try:
+        media = vlc_instance.media_new(video_path)
+        vlc_player.set_media(media)
+        vlc_player.video_set_scale(0)
+        vlc_player.play()
+        time.sleep(0.2)
+        # Seek to start WHILE playing (so display updates to frame 0)
+        vlc_player.set_time(0)
+        time.sleep(0.1)
+        vlc_player.pause()
+        state = vlc_player.get_state()
+        if state == vlc.State.Error:
+            log.error(f"prepare_player failed, VLC state: {state}")
+            return False
+        return True
+    except Exception as e:
+        log.error(f"prepare_player exception: {e}")
+        return False
+
+
+def show_black():
+    """Show black screen via VLC player."""
+    try:
+        if vlc_player and black_media:
+            vlc_player.set_media(black_media)
+            vlc_player.play()
+    except Exception as e:
+        log.error(f"show_black failed: {e}")
 
 
 def shutdown(sig, frame):
     global running
     log.info(f"Signal {sig}, shutting down...")
     running = False
-    if vlc_process and vlc_process.poll() is None:
-        vlc_process.terminate()
-        try:
-            vlc_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            vlc_process.kill()
+    if vlc_player:
+        vlc_player.stop()
     if sock:
         try:
             sock.close()
@@ -272,17 +347,14 @@ def extract_background(video_path):
 
 
 def show_standby():
+    """Show standby image via VLC player."""
     img = BACKGROUND_IMG if os.path.exists(BACKGROUND_IMG) else BLACK_IMG
-    if not os.path.exists(img):
-        return None
+    if not os.path.exists(img) or not vlc_instance or not vlc_player:
+        return
     log.info(f"Showing standby: {img}")
-    try:
-        return subprocess.Popen(
-            VLC_ARGS + ["--image-duration=-1", img],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
-    except Exception:
-        return None
+    media = vlc_instance.media_new(img)
+    vlc_player.set_media(media)
+    vlc_player.play()
 
 
 def send_broadcast(sock, broadcast_ip, sync_port, message):
@@ -293,7 +365,7 @@ def send_broadcast(sock, broadcast_ip, sync_port, message):
 
 
 def main():
-    global vlc_process, sock, running
+    global sock, running
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
@@ -308,6 +380,10 @@ def main():
     sequence_id = int(time.time())
 
     log.info(f"=== Video Sync Master started === (HDMI: {HDMI_PORT}, Seq: {sequence_id})")
+
+    # Wait for network + slaves to be ready
+    log.info("Waiting 5s for network and slaves to come up...")
+    time.sleep(5)
 
     # --- Setup UDP socket ---
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -331,10 +407,10 @@ def main():
     if not os.path.isfile(SD_VIDEO_PATH):
         log.info("No video on SD — showing standby (insert USB with loop.mp4)")
         send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "standby"})
-        bg = show_standby()
-        if bg:
-            bg.wait()
-        time.sleep(5)
+        init_vlc()
+        show_standby()
+        while running:
+            time.sleep(5)
         return
 
     # --- Step 3: Copy SD → RAM ---
@@ -343,45 +419,179 @@ def main():
     video_hash = file_checksum(playback_path)
     extract_background(playback_path)
 
-    # --- Step 4: Notify slaves to stop and prepare ---
+    # Initialize VLC (python-vlc bindings — one instance, stays alive forever)
+    init_vlc()
+
+    # --- Step 4: Initial stop + notify slaves ---
     send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "stop"})
     time.sleep(0.5)
+
+    # Persistent ready-acknowledgment socket (reused across loops)
+    ready_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ready_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ready_sock.bind(("", sync_port + 1))
+    ready_sock.settimeout(1.0)
+
+    PREPARE_LEAD_TIME = 5  # seconds before video end to send prepare
+    loop_delay = 0.5  # seconds between loop detection polls
+
+    def drain_ready_sock():
+        """Drain stale ready messages from previous round."""
+        while True:
+            try:
+                ready_sock.setblocking(False)
+                ready_sock.recvfrom(4096)
+            except BlockingIOError:
+                break
+            except Exception:
+                break
+        ready_sock.setblocking(True)
+        ready_sock.settimeout(1.0)
+
+    def wait_for_slaves(timeout):
+        """Wait for slave ready acknowledgments. Early exit when no new slaves for 0.5s."""
+        ready_slaves = set()
+        prepare_start = time.time()
+        last_new_slave_time = None
+        log.info(f"Waiting up to {timeout}s for slaves to be ready...")
+        while time.time() - prepare_start < timeout:
+            # Early exit: have slaves and no new ones for 0.5s
+            if ready_slaves and last_new_slave_time and time.time() - last_new_slave_time > 0.5:
+                break
+            # Keep sending heartbeats so slave watchdog doesn't fire
+            send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "heartbeat"})
+            try:
+                data, addr = ready_sock.recvfrom(4096)
+                msg = json.loads(data.decode("utf-8"))
+                if msg.get("command") == "ready" and msg.get("sequence_id") == sequence_id:
+                    if addr[0] not in ready_slaves:
+                        last_new_slave_time = time.time()
+                    ready_slaves.add(addr[0])
+                    log.info(f"Slave ready: {addr[0]} ({len(ready_slaves)} total)")
+            except socket.timeout:
+                send_broadcast(sock, broadcast_ip, sync_port, {
+                    **base_msg, "command": "prepare", "video_hash": video_hash,
+                })
+                continue
+            except Exception:
+                continue
+        log.info(f"{len(ready_slaves)} slave(s) ready after {time.time() - prepare_start:.1f}s")
+        return ready_slaves
+
+    def broadcast_play():
+        """Send play command 3x for UDP reliability, then unpause local VLC."""
+        play_msg = {**base_msg, "command": "play"}
+        for _ in range(3):
+            send_broadcast(sock, broadcast_ip, sync_port, play_msg)
+            time.sleep(0.05)
+        vlc_player.play()
+
+    # --- Step 5: Initial synchronized start ---
+    drain_ready_sock()
     send_broadcast(sock, broadcast_ip, sync_port, {
         **base_msg, "command": "prepare", "video_hash": video_hash,
     })
 
-    # Give slaves time to prepare their own USB→SD→RAM pipeline
-    time.sleep(2)
+    # Prepare master VLC: show frame 1 paused
+    prepare_player(playback_path)
+    log.info(f"Pre-buffered: {playback_path}")
 
-    # --- Step 5: Synchronized start ---
+    wait_for_slaves(timeout=10)
+    broadcast_play()
     log.info(f"Playing: {playback_path}")
-    send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "play"})
 
-    cmd = VLC_ARGS + ["--input-repeat=65535", playback_path]
-    vlc_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-    # --- Step 6: Heartbeat loop ---
+    # --- Step 6: Playback loop (hardened) ---
+    is_playing = True
+    consecutive_failures = 0
+    MAX_FAILURES = 5  # re-init VLC after this many consecutive failures
+    STUCK_TIMEOUT = 30  # seconds without state change before considering stuck
+    last_state_change = time.time()
+    last_state = None
     try:
         while running:
-            if vlc_process.poll() is not None:
-                log.info("VLC exited unexpectedly, restarting...")
+            while is_playing and running:
+                send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "heartbeat"})
+                time.sleep(1)
+                try:
+                    state = vlc_player.get_state()
+                except Exception as e:
+                    log.error(f"VLC state query failed: {e}")
+                    is_playing = False
+                    break
+
+                if state != last_state:
+                    last_state_change = time.time()
+                    last_state = state
+
+                if state == vlc.State.Ended:
+                    is_playing = False
+                elif state == vlc.State.Error:
+                    log.error("VLC entered Error state during playback")
+                    is_playing = False
+                elif state in (vlc.State.Stopped, vlc.State.NothingSpecial):
+                    # VLC stopped unexpectedly
+                    if time.time() - last_state_change > 5:
+                        log.error(f"VLC stuck in {state} for 5s — treating as ended")
+                        is_playing = False
+                elif state == vlc.State.Paused:
+                    if time.time() - last_state_change > STUCK_TIMEOUT:
+                        log.warning(f"VLC stuck in Paused for {STUCK_TIMEOUT}s — forcing unpause")
+                        vlc_player.play()
+                        last_state_change = time.time()
+
+            if not running:
                 break
-            send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "heartbeat"})
-            time.sleep(1)
+
+            log.info("--- Video ended. Resetting for loop. ---")
+            # Tell slaves to prepare FIRST
+            drain_ready_sock()
+            send_broadcast(sock, broadcast_ip, sync_port, {
+                **base_msg, "command": "prepare", "video_hash": video_hash,
+            })
+            # Prepare master
+            success = prepare_player(playback_path)
+            if not success:
+                consecutive_failures += 1
+                log.error(f"prepare_player failed ({consecutive_failures}/{MAX_FAILURES})")
+                if consecutive_failures >= MAX_FAILURES:
+                    log.warning("Too many failures — re-initializing VLC")
+                    init_vlc()
+                    consecutive_failures = 0
+                time.sleep(1)
+                continue
+
+            # Wait for slaves (sends heartbeats during wait)
+            wait_for_slaves(timeout=3)
+            # Play all
+            broadcast_play()
+
+            # Verify play started
+            time.sleep(0.5)
+            verify_state = vlc_player.get_state()
+            if verify_state not in (vlc.State.Playing, vlc.State.Opening, vlc.State.Buffering):
+                log.warning(f"Play may have failed, VLC state: {verify_state} — retrying")
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_FAILURES:
+                    log.warning("Too many failures — re-initializing VLC")
+                    init_vlc()
+                    consecutive_failures = 0
+                continue
+
+            consecutive_failures = 0
+            is_playing = True
+            last_state_change = time.time()
+            last_state = vlc.State.Playing
+            log.info("Loop restarted — all nodes playing")
+
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        log.error(f"Unhandled exception in playback loop: {e}")
 
     # --- Cleanup ---
-    exit_code = vlc_process.returncode if vlc_process.returncode is not None else -1
-    try:
-        stderr_out = vlc_process.stderr.read().decode(errors="replace") if vlc_process.stderr else ""
-    except Exception:
-        stderr_out = ""
-    if stderr_out:
-        log.info(f"VLC exited ({exit_code}): {stderr_out[:500]}")
-    else:
-        log.info(f"VLC exited ({exit_code})")
-
+    if vlc_player:
+        vlc_player.stop()
+    ready_sock.close()
     send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "stop"})
     shutil.rmtree(RAM_COPY_DIR, ignore_errors=True)
     sock.close()

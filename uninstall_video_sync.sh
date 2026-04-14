@@ -85,6 +85,31 @@ rm -f /usr/local/bin/video-sync-status
 rm -f /usr/local/bin/video-sync-logs
 rm -f /usr/local/bin/video-sync-restart
 
+# --- Remove ZeroTier ---
+if command -v zerotier-cli &>/dev/null; then
+    info "Leaving ZeroTier networks and removing..."
+    for nw in $(zerotier-cli listnetworks -j 2>/dev/null | grep -oP '"nwid"\s*:\s*"\K[^"]+'); do
+        zerotier-cli leave "$nw" 2>/dev/null || true
+    done
+    systemctl stop zerotier-one.service 2>/dev/null || true
+    systemctl disable zerotier-one.service 2>/dev/null || true
+    apt-get purge -y zerotier-one 2>/dev/null || true
+    rm -rf /var/lib/zerotier-one
+    info "ZeroTier removed."
+else
+    info "ZeroTier not installed, skipping."
+fi
+
+# --- Restore Ethernet to DHCP ---
+info "Restoring Ethernet to DHCP..."
+ETH_CON=$(nmcli -t -f NAME,TYPE connection show | grep ':.*ethernet' | head -n1 | cut -d: -f1)
+if [ -n "$ETH_CON" ]; then
+    nmcli connection modify "${ETH_CON}" ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns "" 2>/dev/null || true
+    info "Ethernet '${ETH_CON}' restored to DHCP. Will apply after reboot."
+else
+    warn "No ethernet connection found. Skipping DHCP restore."
+fi
+
 # --- Restore config.txt ---
 info "Restoring config.txt..."
 CONFIG_FILE="/boot/firmware/config.txt"

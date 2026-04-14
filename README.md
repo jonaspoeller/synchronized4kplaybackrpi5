@@ -15,6 +15,7 @@ A solution for synchronized, looping video playback across multiple Raspberry Pi
 *   **Universal USB Support:** FAT32, exFAT, NTFS, ext2/3/4, with or without partition table.
 *   **Master Failure Recovery:** Watchdog on each slave reverts to black screen if master signal lost.
 *   **Automatic Slave Integration:** Late-started slaves are integrated on next master restart.
+*   **Audio Output (Master):** Optional audio via HDMI or USB sound card (ALSA), configurable during setup.
 *   **Multi-Group Support:** Multiple independent player groups on the same network via different ports.
 *   **Silent Boot:** No console output, no splash screen, no cursor — black from power-on to playback.
 *   **System Hardening:** Journal limited, apt auto-updates disabled, hardware watchdog, unnecessary services disabled.
@@ -60,20 +61,7 @@ The installation must be performed on **every** Pi (both Master and Slaves).
 #### Step 1: Prepare the System
 
 1.  **Flash** Raspberry Pi OS Lite (Trixie, 64-bit) to your SD card.
-2.  **Set a Static IP Address:**
-    ```bash
-    # Find your connection name
-    nmcli connection show
-
-    # Set static IP (adjust values for your network)
-    sudo nmcli c mod "Wired connection 1" ipv4.method manual \
-    ipv4.addresses 10.0.0.220/24 \
-    ipv4.gateway 10.0.0.1 \
-    ipv4.dns "8.8.8.8,1.1.1.1"
-
-    # Apply
-    sudo nmcli c down "Wired connection 1"; sudo nmcli c up "Wired connection 1"
-    ```
+2.  **Connect via Ethernet** and boot with DHCP (default).
 
 #### Step 2: Run the Automated Installer
 
@@ -92,12 +80,16 @@ The installation must be performed on **every** Pi (both Master and Slaves).
 #### Step 3: Follow the Interactive Prompts
 
 The script will ask for:
-*   The static IP address and subnet of the current device (e.g., `192.168.1.10/24`).
-*   The network port for this sync group (e.g., `5555`).
-*   The role of the device (Master or Slave).
-*   The IP address of the Master (if configuring a Slave).
+*   The **static IP address and subnet** of the current device (e.g., `192.168.1.10/24`).
+*   The **gateway IP** address (e.g., `192.168.1.1`).
+*   The **DNS server IP** (e.g., `192.168.1.1` or `8.8.8.8`).
+*   The **sync port** for this group (e.g., `5555`).
+*   The **role** of the device (Master or Slave).
+*   The **Master's IP address** (if configuring a Slave).
+*   **Audio output** yes/no and device selection — HDMI or USB sound card (Master only).
+*   The **ZeroTier Network ID** for remote SSH access (optional, leave empty to skip).
 
-The device reboots automatically. After reboot, insert a USB stick with `loop.mp4` to start playback.
+The installer automatically configures the Ethernet interface to use the specified static IP via NetworkManager (`nmcli`). If a ZeroTier Network ID is provided, ZeroTier is installed and the device joins the network — you must authorize it in your [ZeroTier Central](https://my.zerotier.com/) dashboard. The device reboots automatically. After reboot, insert a USB stick with `loop.mp4` to start playback.
 
 ---
 
@@ -112,7 +104,13 @@ Path: `/opt/video-sync/sync_config.ini`
 master_ip = 192.168.1.10
 broadcast_ip = 192.168.1.255
 sync_port = 5555
+
+[audio]
+enabled = yes
+alsa_device = hw:1,0
 ```
+
+Set `enabled = no` or remove the `[audio]` section to disable audio. The `alsa_device` value corresponds to ALSA hardware device notation (`hw:card,device`). Use `aplay -l` to list available devices.
 
 ### Slave Configuration
 
@@ -170,6 +168,7 @@ VLC 3.0 has a known limitation: there is a brief flash (~30ms / 1-3 frames) betw
 - **Unnecessary timers disabled** — fstrim, e2scrub, man-db, dpkg-db-backup
 - **tmpfiles-clean exception** — RAM video copy protected from cleanup
 - **WiFi + SSH remain active** for remote management
+- **ZeroTier VPN** (optional) — remote SSH access from anywhere
 
 ---
 
@@ -182,7 +181,7 @@ chmod +x uninstall_video_sync.sh
 sudo ./uninstall_video_sync.sh
 ```
 
-This reverts all system changes (config.txt, cmdline.txt, services, udev rules, hardening, sudoers) and reboots.
+This reverts all system changes (config.txt, cmdline.txt, services, udev rules, hardening, sudoers, **static IP → DHCP**, **ZeroTier removed**) and reboots.
 
 ---
 

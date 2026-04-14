@@ -23,6 +23,7 @@ import glob
 import hashlib
 import configparser
 import threading
+import vlc
 
 # --- Configuration ---
 MOUNT_POINT = "/mnt/usb"
@@ -55,8 +56,7 @@ def detect_hdmi_port():
 
 HDMI_PORT = detect_hdmi_port()
 
-VLC_ARGS = [
-    "cvlc",
+VLC_ARGS_STR = ' '.join([
     "--no-xlib",
     "--quiet",
     "--fullscreen",
@@ -68,7 +68,7 @@ VLC_ARGS = [
     "--drm-vout-pool-dmabuf",
     "--no-audio",
     "--file-caching=2000",
-]
+])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,42 +77,39 @@ logging.basicConfig(
 )
 log = logging.getLogger("video-sync-slave")
 
-vlc_process = None
-standby_process = None
+# VLC instance and player (python-vlc bindings, like Pi4 project)
+vlc_instance = None
+vlc_player = None
+black_media = None
 running = True
 last_heartbeat = time.time()
 current_sequence_id = None
+is_prepared = False
+video_loaded = False  # True after first prepare (DRM acquired)
+
+
+def init_vlc():
+    """Initialize (or re-initialize) VLC instance and player."""
+    global vlc_instance, vlc_player, black_media
+    if vlc_player:
+        try:
+            vlc_player.stop()
+        except Exception:
+            pass
+    vlc_instance = vlc.Instance(VLC_ARGS_STR)
+    vlc_player = vlc_instance.media_player_new()
+    if os.path.exists(BLACK_IMG):
+        black_media = vlc_instance.media_new(BLACK_IMG)
+    log.info("VLC instance initialized (python-vlc bindings)")
 
 
 def shutdown(sig, frame):
     global running
     log.info(f"Signal {sig}, shutting down...")
     running = False
-    kill_vlc()
-    kill_standby()
+    if vlc_player:
+        vlc_player.stop()
     sys.exit(0)
-
-
-def kill_vlc():
-    global vlc_process
-    if vlc_process and vlc_process.poll() is None:
-        vlc_process.terminate()
-        try:
-            vlc_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            vlc_process.kill()
-    vlc_process = None
-
-
-def kill_standby():
-    global standby_process
-    if standby_process and standby_process.poll() is None:
-        standby_process.terminate()
-        try:
-            standby_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            standby_process.kill()
-    standby_process = None
 
 
 def file_checksum(path, chunk_size=1024 * 1024):
@@ -287,61 +284,80 @@ def extract_background(video_path):
         pass
 
 
-def show_standby():
-    global standby_process
-    kill_standby()
-    img = BACKGROUND_IMG if os.path.exists(BACKGROUND_IMG) else BLACK_IMG
-    if not os.path.exists(img):
-        return
-    log.info(f"Showing standby: {img}")
-    try:
-        standby_process = subprocess.Popen(
-            VLC_ARGS + ["--image-duration=-1", img],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
-    except Exception:
-        pass
-
-
 def show_black():
-    global standby_process
-    kill_standby()
-    if not os.path.exists(BLACK_IMG):
-        return
-    log.info("Showing black screen")
+    """Show black screen via VLC player (no process restart)."""
     try:
-        standby_process = subprocess.Popen(
-            VLC_ARGS + ["--image-duration=-1", BLACK_IMG],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
-    except Exception:
-        pass
+        if vlc_player and black_media:
+            log.info("Showing black screen")
+            vlc_player.set_media(black_media)
+            vlc_player.play()
+    except Exception as e:
+        log.error(f"show_black failed: {e}")
 
 
-def start_playback(playback_path):
-    global vlc_process
-    kill_vlc()
-    kill_standby()
-    log.info(f"Playing: {playback_path}")
-    cmd = VLC_ARGS + ["--input-repeat=65535", playback_path]
-    vlc_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+def prepare_player(video_path):
+    """Prepare VLC: frame 1 paused. Exact Pi4 approach — no stop(), keeps DRM/HDMI alive.
+    Returns True on success.
+    """
+    if not vlc_instance or not vlc_player:
+        log.error("prepare_player: VLC not initialized")
+        return False
+    try:
+        media = vlc_instance.media_new(video_path)
+        vlc_player.set_media(media)
+        vlc_player.video_set_scale(0)
+        vlc_player.play()
+        time.sleep(0.2)
+        # Seek to start WHILE playing (so display updates to frame 0)
+        vlc_player.set_time(0)
+        time.sleep(0.1)
+        vlc_player.pause()
+        state = vlc_player.get_state()
+        if state == vlc.State.Error:
+            log.error(f"prepare_player failed, VLC state: {state}")
+            return False
+        log.info(f"Prepared (frame 1 visible): {video_path}")
+        return True
+    except Exception as e:
+        log.error(f"prepare_player exception: {e}")
+        return False
 
 
 def master_watchdog():
     """Background thread: revert to black screen if master heartbeat lost."""
-    global last_heartbeat, current_sequence_id
+    global last_heartbeat, current_sequence_id, is_prepared, video_loaded
+    vlc_error_count = 0
     while running:
         time.sleep(2)
         if time.time() - last_heartbeat > 5:
             log.warning("Master signal lost! Reverting to black screen.")
-            kill_vlc()
             show_black()
             last_heartbeat = time.time()
             current_sequence_id = None
+            is_prepared = False
+            video_loaded = False
+
+        # VLC health check: detect stuck Error state
+        try:
+            if vlc_player:
+                state = vlc_player.get_state()
+                if state == vlc.State.Error:
+                    vlc_error_count += 1
+                    if vlc_error_count >= 3:
+                        log.error("VLC stuck in Error — re-initializing")
+                        init_vlc()
+                        show_black()
+                        is_prepared = False
+                        video_loaded = False
+                        vlc_error_count = 0
+                else:
+                    vlc_error_count = 0
+        except Exception as e:
+            log.error(f"VLC health check failed: {e}")
 
 
 def main():
-    global vlc_process, running, last_heartbeat, current_sequence_id
+    global running, last_heartbeat, current_sequence_id, is_prepared, video_loaded
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
@@ -359,6 +375,9 @@ def main():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("", sync_port))
     sock.settimeout(1.0)
+
+    # Initialize VLC (python-vlc bindings — one instance, stays alive forever)
+    init_vlc()
 
     # Remove stale background
     try:
@@ -380,7 +399,7 @@ def main():
 
     # --- Show black screen while waiting ---
     show_black()
-    log.info("Black screen displayed. Waiting for master commands.")
+    log.info("Black screen displayed. Waiting for master commands (python-vlc).")
 
     # --- Start watchdog ---
     watchdog_thread = threading.Thread(target=master_watchdog, daemon=True)
@@ -418,17 +437,14 @@ def main():
 
             if command == "stop":
                 log.info("Master: stop")
-                kill_vlc()
                 show_black()
 
             elif command == "standby":
                 log.info("Master: standby (no video)")
-                kill_vlc()
-                show_standby()
+                show_black()
 
             elif command == "prepare":
                 log.info("Master: prepare")
-                # Ensure we have a video ready
                 if not playback_path or not os.path.isfile(playback_path):
                     if os.path.isfile(SD_VIDEO_PATH):
                         ram_video = copy_to_ram()
@@ -438,12 +454,57 @@ def main():
                         log.warning("No video available for playback")
                         playback_path = None
 
-            elif command == "play":
-                if playback_path and os.path.isfile(playback_path):
-                    log.info("Master: play")
-                    start_playback(playback_path)
+                if not playback_path:
+                    continue
+
+                def _send_ready(seq_id):
+                    try:
+                        ready_msg = json.dumps({
+                            "command": "ready",
+                            "sequence_id": seq_id,
+                        }).encode("utf-8")
+                        rs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        rs.sendto(ready_msg, (master_ip, sync_port + 1))
+                        rs.close()
+                        log.info("Sent ready to master")
+                    except Exception as e:
+                        log.error(f"Failed to send ready: {e}")
+
+                if is_prepared:
+                    log.info("Already prepared — re-sending ready")
+                    _send_ready(current_sequence_id)
+                    continue
+
+                # Prepare: show frame 1 paused
+                success = prepare_player(playback_path)
+                if success:
+                    is_prepared = True
+                    _send_ready(current_sequence_id)
                 else:
-                    log.warning("Play command received but no video available")
+                    log.error("Prepare failed — re-initializing VLC")
+                    init_vlc()
+                    success = prepare_player(playback_path)
+                    if success:
+                        is_prepared = True
+                        _send_ready(current_sequence_id)
+                    else:
+                        log.error("Prepare failed after VLC re-init")
+
+            elif command == "play":
+                is_prepared = False
+                log.info("Master: play")
+                if vlc_player:
+                    try:
+                        vlc_player.play()
+                        # Verify playback started
+                        time.sleep(0.3)
+                        state = vlc_player.get_state()
+                        if state not in (vlc.State.Playing, vlc.State.Opening, vlc.State.Buffering):
+                            log.warning(f"Play may have failed, VLC state: {state}")
+                    except Exception as e:
+                        log.error(f"Play failed: {e}")
+                else:
+                    log.warning("Play command but VLC player not initialized")
 
             elif command == "heartbeat":
                 pass  # Just updates last_heartbeat above
@@ -452,8 +513,8 @@ def main():
         pass
 
     # --- Cleanup ---
-    kill_vlc()
-    kill_standby()
+    if vlc_player:
+        vlc_player.stop()
     shutil.rmtree(RAM_COPY_DIR, ignore_errors=True)
     sock.close()
     log.info("=== Video Sync Slave stopped ===")

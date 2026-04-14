@@ -44,6 +44,8 @@ echo "================================================="
 echo ""
 echo "--- Network Configuration ---"
 read -p "Enter the static IP address and subnet for this device (e.g., 192.168.1.10/24): " device_ip_cidr
+read -p "Enter the gateway IP address (e.g., 192.168.1.1): " gateway_ip
+read -p "Enter the DNS server IP (e.g., 192.168.1.1 or 8.8.8.8): " dns_ip
 read -p "Enter the sync port for this group (e.g., 5555): " sync_port
 
 # --- Robust Broadcast-IP-Calculation ---
@@ -60,6 +62,16 @@ bcast_int=$(( (ip_int & mask_int) | ~mask_int & 0xFFFFFFFF ))
 BROADCAST_IP="$(( (bcast_int >> 24) & 0xFF )).$(( (bcast_int >> 16) & 0xFF )).$(( (bcast_int >> 8) & 0xFF )).$(( bcast_int & 0xFF ))"
 info "Calculated Broadcast IP: $BROADCAST_IP"
 
+# --- Validate gateway and DNS ---
+if ! [[ "$gateway_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    error "Invalid gateway IP address."
+    exit 1
+fi
+if ! [[ "$dns_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    error "Invalid DNS server IP address."
+    exit 1
+fi
+
 echo ""
 echo "--- Role Configuration ---"
 echo "1) Master Node (controls playback)"
@@ -72,6 +84,48 @@ else
     node_type="1"
     master_ip=$IP
 fi
+
+# --- Audio Configuration (Master only) ---
+audio_enabled="no"
+audio_alsa_device=""
+if [ "$node_type" == "1" ]; then
+    echo ""
+    echo "--- Audio Configuration (Master only) ---"
+    read -p "Enable audio output on the Master? [y/N]: " audio_choice
+    if [[ "$audio_choice" =~ ^[yYjJ]$ ]]; then
+        audio_enabled="yes"
+        echo ""
+        echo "Available audio output devices:"
+        echo "---"
+        # List ALSA playback devices with index
+        mapfile -t audio_devices < <(aplay -l 2>/dev/null | grep '^card ')
+        if [ ${#audio_devices[@]} -eq 0 ]; then
+            warn "No audio devices found! Audio will be disabled."
+            audio_enabled="no"
+        else
+            for i in "${!audio_devices[@]}"; do
+                echo "  $((i+1))) ${audio_devices[$i]}"
+            done
+            echo ""
+            read -p "Select audio device [1-${#audio_devices[@]}]: " audio_dev_choice
+            if [[ "$audio_dev_choice" =~ ^[0-9]+$ ]] && [ "$audio_dev_choice" -ge 1 ] && [ "$audio_dev_choice" -le ${#audio_devices[@]} ]; then
+                selected="${audio_devices[$((audio_dev_choice-1))]}"
+                # Extract card and device number: "card 1: USB Audio [USB Audio], device 0: ..."
+                card_num=$(echo "$selected" | grep -oP 'card \K[0-9]+')
+                dev_num=$(echo "$selected" | grep -oP 'device \K[0-9]+')
+                audio_alsa_device="hw:${card_num},${dev_num}"
+                info "Selected audio device: $audio_alsa_device ($selected)"
+            else
+                error "Invalid selection. Audio will be disabled."
+                audio_enabled="no"
+            fi
+        fi
+    fi
+fi
+
+echo ""
+echo "--- Remote Access (ZeroTier) ---"
+read -p "Enter your ZeroTier Network ID (16-digit hex, or leave empty to skip): " zerotier_network_id
 echo ""
 
 # ============================================================================
@@ -80,6 +134,46 @@ apt-get update -y
 apt-get install -y vlc ffmpeg python3 ntfs-3g exfatprogs
 
 info "Dependencies installed."
+
+# ============================================================================
+if [ -n "$zerotier_network_id" ]; then
+    info "Installing ZeroTier..."
+    curl -s https://install.zerotier.com | bash
+    systemctl enable zerotier-one.service
+    systemctl start zerotier-one.service
+
+    # Wait for ZeroTier service to be ready
+    sleep 3
+
+    info "Joining ZeroTier network: $zerotier_network_id"
+    zerotier-cli join "$zerotier_network_id"
+
+    info "ZeroTier installed and joined network."
+    info "IMPORTANT: You must authorize this device in your ZeroTier Central dashboard."
+    info "ZeroTier Node ID: $(zerotier-cli info | awk '{print $3}')"
+
+    # Ensure SSH is enabled and listens on all interfaces (including ZeroTier)
+    systemctl enable ssh.service 2>/dev/null || true
+    systemctl start ssh.service 2>/dev/null || true
+    info "SSH enabled for remote access via ZeroTier."
+else
+    info "ZeroTier skipped (no Network ID provided)."
+fi
+
+# ============================================================================
+info "Configuring static IP on Ethernet via NetworkManager..."
+
+# Find the ethernet connection name (language-independent)
+ETH_CON=$(nmcli -t -f NAME,TYPE connection show | grep ':.*ethernet' | head -n1 | cut -d: -f1)
+if [ -z "$ETH_CON" ]; then
+    warn "No ethernet connection found in NetworkManager. Skipping static IP configuration."
+    warn "You must configure the static IP manually."
+else
+    info "Found ethernet connection: '${ETH_CON}'"
+    nmcli connection modify "${ETH_CON}" ipv4.addresses "${device_ip_cidr}" ipv4.gateway "${gateway_ip}" ipv4.dns "${dns_ip}" ipv4.method manual
+    info "Static IP configured: ${device_ip_cidr}, Gateway: ${gateway_ip}, DNS: ${dns_ip}"
+    info "Network will be applied after reboot."
+fi
 
 # ============================================================================
 info "Configuring user permissions..."
@@ -235,6 +329,10 @@ if [ "$node_type" == "1" ]; then
 master_ip = $master_ip
 broadcast_ip = $BROADCAST_IP
 sync_port = $sync_port
+
+[audio]
+enabled = $audio_enabled
+alsa_device = $audio_alsa_device
 EOF
 
     info "Installing Master script..."
@@ -247,7 +345,7 @@ Flow: USB → SD → RAM → Synchronized Playback
   1. If USB present: copy video from USB to SD, then eject USB
   2. Copy video from SD to RAM (tmpfs)
   3. Broadcast sync commands to slaves
-  4. Play from RAM in a seamless loop (cvlc --input-repeat)
+  4. Play from RAM, re-sync all nodes at each loop boundary
   5. New USB inserted → udev restarts service → video updated
 """
 
@@ -275,6 +373,7 @@ RAM_VIDEO_PATH = os.path.join(RAM_COPY_DIR, VIDEO_FILENAME)
 BACKGROUND_IMG = os.path.join(INSTALL_DIR, "background.png")
 BLACK_IMG = os.path.join(INSTALL_DIR, "black.png")
 CONFIG_FILE = os.path.join(INSTALL_DIR, "sync_config.ini")
+VLC_RC_SOCK = "/tmp/vlc-sync-master.sock"
 
 
 def detect_hdmi_port():
@@ -295,20 +394,34 @@ def detect_hdmi_port():
 
 HDMI_PORT = detect_hdmi_port()
 
-VLC_ARGS = [
-    "cvlc",
-    "--no-xlib",
-    "--quiet",
-    "--fullscreen",
-    "--no-video-title-show",
-    "--no-osd",
-    "--codec=drm_avcodec",
-    "--vout=drm_vout",
-    f"--drm-vout-display={HDMI_PORT}",
-    "--drm-vout-pool-dmabuf",
-    "--no-audio",
-    "--file-caching=2000",
-]
+
+def build_vlc_args():
+    """Build VLC command arguments, reading audio config from sync_config.ini."""
+    args = [
+        "cvlc",
+        "--no-xlib",
+        "--quiet",
+        "--fullscreen",
+        "--no-video-title-show",
+        "--no-osd",
+        "--codec=drm_avcodec",
+        "--vout=drm_vout",
+        f"--drm-vout-display={HDMI_PORT}",
+        "--drm-vout-pool-dmabuf",
+        "--file-caching=2000",
+    ]
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE)
+    audio_enabled = config.get("audio", "enabled", fallback="no").strip().lower()
+    alsa_device = config.get("audio", "alsa_device", fallback="").strip()
+    if audio_enabled == "yes" and alsa_device:
+        args += ["--aout=alsa", f"--alsa-audio-device={alsa_device}"]
+    else:
+        args.append("--no-audio")
+    return args
+
+
+VLC_ARGS = build_vlc_args()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -320,6 +433,43 @@ log = logging.getLogger("video-sync-master")
 vlc_process = None
 sock = None
 running = True
+
+
+def vlc_rc_command(cmd):
+    """Send a command to VLC via its RC unix socket (fire-and-forget)."""
+    import socket as sock_mod
+    try:
+        s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(VLC_RC_SOCK)
+        s.sendall((cmd + "\n").encode())
+        s.close()
+    except Exception as e:
+        log.error(f"VLC RC command '{cmd}' failed: {e}")
+
+
+def vlc_rc_query(cmd):
+    """Send a command to VLC RC socket and return the response string."""
+    import socket as sock_mod
+    try:
+        s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(VLC_RC_SOCK)
+        try:
+            s.recv(4096)
+        except Exception:
+            pass
+        s.sendall((cmd + "\n").encode())
+        time.sleep(0.05)
+        resp = s.recv(4096).decode("utf-8", errors="replace").strip()
+        s.close()
+        for line in resp.splitlines():
+            line = line.strip().strip(">").strip()
+            if line.isdigit():
+                return int(line)
+        return None
+    except Exception:
+        return None
 
 
 def shutdown(sig, frame):
@@ -582,45 +732,143 @@ def main():
     video_hash = file_checksum(playback_path)
     extract_background(playback_path)
 
-    # --- Step 4: Notify slaves to stop and prepare ---
+    # --- Step 4: Initial stop + notify slaves ---
     send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "stop"})
     time.sleep(0.5)
+
+    # Persistent ready-acknowledgment socket (reused across loops)
+    ready_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ready_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ready_sock.bind(("", sync_port + 1))
+    ready_sock.settimeout(1.0)
+
+    PREPARE_LEAD_TIME = 5  # seconds before video end to send prepare
+
+    def drain_ready_sock():
+        """Drain stale ready messages from previous round."""
+        while True:
+            try:
+                ready_sock.setblocking(False)
+                ready_sock.recvfrom(4096)
+            except BlockingIOError:
+                break
+            except Exception:
+                break
+        ready_sock.setblocking(True)
+        ready_sock.settimeout(1.0)
+
+    def wait_for_slaves(timeout):
+        """Wait for slave ready acknowledgments. Returns set of ready IPs."""
+        ready_slaves = set()
+        prepare_start = time.time()
+        log.info(f"Waiting up to {timeout}s for slaves to be ready...")
+        while time.time() - prepare_start < timeout:
+            try:
+                data, addr = ready_sock.recvfrom(4096)
+                msg = json.loads(data.decode("utf-8"))
+                if msg.get("command") == "ready" and msg.get("sequence_id") == sequence_id:
+                    ready_slaves.add(addr[0])
+                    log.info(f"Slave ready: {addr[0]} ({len(ready_slaves)} total)")
+            except socket.timeout:
+                send_broadcast(sock, broadcast_ip, sync_port, {
+                    **base_msg, "command": "prepare", "video_hash": video_hash,
+                })
+                continue
+            except Exception:
+                continue
+        log.info(f"{len(ready_slaves)} slave(s) ready after {time.time() - prepare_start:.1f}s")
+        return ready_slaves
+
+    def broadcast_play():
+        """Send play command 3x for UDP reliability, then unpause local VLC."""
+        play_msg = {**base_msg, "command": "play"}
+        for _ in range(3):
+            send_broadcast(sock, broadcast_ip, sync_port, play_msg)
+            time.sleep(0.05)
+        vlc_rc_command("pause")
+
+    # --- Step 5: Initial synchronized start ---
+    drain_ready_sock()
     send_broadcast(sock, broadcast_ip, sync_port, {
         **base_msg, "command": "prepare", "video_hash": video_hash,
     })
 
-    # Give slaves time to prepare their own USB→SD→RAM pipeline
-    time.sleep(2)
-
-    # --- Step 5: Synchronized start ---
-    log.info(f"Playing: {playback_path}")
-    send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "play"})
-
-    cmd = VLC_ARGS + ["--input-repeat=65535", playback_path]
+    try:
+        os.remove(VLC_RC_SOCK)
+    except FileNotFoundError:
+        pass
+    cmd = ["vlc", "-I", "oldrc", f"--rc-unix={VLC_RC_SOCK}", "--rc-fake-tty"] + VLC_ARGS[1:] + [
+        "--start-paused", "--input-repeat=65535", playback_path,
+    ]
+    log.info(f"Pre-buffering: {playback_path}")
     vlc_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-    # --- Step 6: Heartbeat loop ---
+    for _ in range(50):
+        if os.path.exists(VLC_RC_SOCK):
+            break
+        time.sleep(0.1)
+    else:
+        log.warning("VLC RC socket did not appear in time")
+
+    wait_for_slaves(timeout=10)
+    broadcast_play()
+    log.info(f"Playing: {playback_path}")
+
+    # --- Step 6: Playback loop with position monitoring ---
+    # Master VLC loops natively via --input-repeat (no black frame, no restart).
+    # We detect the time wrap-around (time drops from near-end to near-0)
+    # and sync slaves at each loop boundary.
+    slaves_prepared = False
+    prev_time = 0
+    video_length = None
     try:
         while running:
             if vlc_process.poll() is not None:
-                log.info("VLC exited unexpectedly, restarting...")
+                log.warning("VLC process died unexpectedly, restarting...")
                 break
+
+            cur_time = vlc_rc_query("get_time")
+            length = vlc_rc_query("get_length")
+
+            if cur_time is not None and length is not None and length > 0:
+                video_length = length
+                remaining = length - cur_time
+
+                if remaining <= PREPARE_LEAD_TIME and not slaves_prepared:
+                    log.info(f"Video ending in {remaining}s — preparing slaves for next loop")
+                    drain_ready_sock()
+                    send_broadcast(sock, broadcast_ip, sync_port, {
+                        **base_msg, "command": "prepare", "video_hash": video_hash,
+                    })
+                    slaves_prepared = True
+
+                # Detect wrap-around: time was near end, now jumped back to start
+                if slaves_prepared and cur_time < prev_time and prev_time > (length / 2):
+                    log.info(f"--- Loop wrap detected (prev={prev_time}, cur={cur_time}) — syncing slaves ---")
+                    wait_for_slaves(timeout=3)
+                    play_msg = {**base_msg, "command": "play"}
+                    for _ in range(3):
+                        send_broadcast(sock, broadcast_ip, sync_port, play_msg)
+                        time.sleep(0.05)
+                    log.info("Slaves synced at loop boundary")
+                    slaves_prepared = False
+
+                prev_time = cur_time
+
             send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "heartbeat"})
-            time.sleep(1)
+            time.sleep(0.25)
     except KeyboardInterrupt:
         pass
 
     # --- Cleanup ---
-    exit_code = vlc_process.returncode if vlc_process.returncode is not None else -1
-    try:
-        stderr_out = vlc_process.stderr.read().decode(errors="replace") if vlc_process.stderr else ""
-    except Exception:
-        stderr_out = ""
-    if stderr_out:
-        log.info(f"VLC exited ({exit_code}): {stderr_out[:500]}")
-    else:
-        log.info(f"VLC exited ({exit_code})")
+    if vlc_process and vlc_process.poll() is None:
+        vlc_process.terminate()
+        try:
+            vlc_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            vlc_process.kill()
 
+    ready_sock.close()
     send_broadcast(sock, broadcast_ip, sync_port, {**base_msg, "command": "stop"})
     shutil.rmtree(RAM_COPY_DIR, ignore_errors=True)
     sock.close()
@@ -681,6 +929,7 @@ RAM_VIDEO_PATH = os.path.join(RAM_COPY_DIR, VIDEO_FILENAME)
 BACKGROUND_IMG = os.path.join(INSTALL_DIR, "background.png")
 BLACK_IMG = os.path.join(INSTALL_DIR, "black.png")
 CONFIG_FILE = os.path.join(INSTALL_DIR, "sync_config.ini")
+VLC_RC_SOCK = "/tmp/vlc-sync-slave.sock"
 
 
 def detect_hdmi_port():
@@ -728,6 +977,19 @@ standby_process = None
 running = True
 last_heartbeat = time.time()
 current_sequence_id = None
+is_prepared = False
+
+
+def vlc_rc_command(cmd):
+    """Send a command to VLC via its RC unix socket."""
+    import socket as sock_mod
+    try:
+        s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+        s.connect(VLC_RC_SOCK)
+        s.sendall((cmd + "\n").encode())
+        s.close()
+    except Exception as e:
+        log.error(f"VLC RC command '{cmd}' failed: {e}")
 
 
 def shutdown(sig, frame):
@@ -967,7 +1229,7 @@ def start_playback(playback_path):
     kill_vlc()
     kill_standby()
     log.info(f"Playing: {playback_path}")
-    cmd = VLC_ARGS + ["--input-repeat=65535", playback_path]
+    cmd = VLC_ARGS + [playback_path]
     vlc_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -985,7 +1247,7 @@ def master_watchdog():
 
 
 def main():
-    global vlc_process, running, last_heartbeat, current_sequence_id
+    global vlc_process, running, last_heartbeat, current_sequence_id, is_prepared
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
@@ -1072,7 +1334,6 @@ def main():
 
             elif command == "prepare":
                 log.info("Master: prepare")
-                # Ensure we have a video ready
                 if not playback_path or not os.path.isfile(playback_path):
                     if os.path.isfile(SD_VIDEO_PATH):
                         ram_video = copy_to_ram()
@@ -1082,9 +1343,72 @@ def main():
                         log.warning("No video available for playback")
                         playback_path = None
 
+                if not playback_path:
+                    continue
+
+                def _send_ready(seq_id):
+                    try:
+                        ready_msg = json.dumps({
+                            "command": "ready",
+                            "sequence_id": seq_id,
+                        }).encode("utf-8")
+                        rs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        rs.sendto(ready_msg, (master_ip, sync_port + 1))
+                        rs.close()
+                        log.info("Sent ready to master")
+                    except Exception as e:
+                        log.error(f"Failed to send ready: {e}")
+
+                # If VLC is already running, seek to 0 + pause (no kill = no black)
+                if vlc_process and vlc_process.poll() is None and os.path.exists(VLC_RC_SOCK):
+                    if is_prepared:
+                        log.info("Already prepared — re-sending ready")
+                        _send_ready(current_sequence_id)
+                        continue
+                    log.info("Seeking to start + pausing (no restart)")
+                    vlc_rc_command("seek 0")
+                    time.sleep(0.05)
+                    vlc_rc_command("pause")
+                    is_prepared = True
+                    _send_ready(current_sequence_id)
+                    continue
+
+                # First time or VLC died: start fresh
+                kill_vlc()
+                kill_standby()
+                try:
+                    os.remove(VLC_RC_SOCK)
+                except FileNotFoundError:
+                    pass
+                prebuf_cmd = ["vlc", "-I", "oldrc", f"--rc-unix={VLC_RC_SOCK}", "--rc-fake-tty"] + VLC_ARGS[1:] + [
+                    "--start-paused", "--input-repeat=65535", playback_path,
+                ]
+                log.info(f"Pre-buffering (first start): {playback_path}")
+                vlc_process = subprocess.Popen(prebuf_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                is_prepared = True
+
+                def _wait_and_ready(seq_id):
+                    for _ in range(50):
+                        if os.path.exists(VLC_RC_SOCK):
+                            break
+                        time.sleep(0.1)
+                    else:
+                        log.warning("VLC RC socket did not appear in time")
+                    _send_ready(seq_id)
+
+                threading.Thread(
+                    target=_wait_and_ready,
+                    args=(current_sequence_id,),
+                    daemon=True,
+                ).start()
+
             elif command == "play":
-                if playback_path and os.path.isfile(playback_path):
-                    log.info("Master: play")
+                is_prepared = False
+                if vlc_process and vlc_process.poll() is None:
+                    log.info("Master: play (unpause)")
+                    vlc_rc_command("pause")
+                elif playback_path and os.path.isfile(playback_path):
+                    log.info("Master: play (cold start)")
                     start_playback(playback_path)
                 else:
                     log.warning("Play command received but no video available")
